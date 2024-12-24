@@ -1,7 +1,10 @@
+import pickle
 import sys
+from typing import Tuple, Annotated
+
 import numpy as np
 import random
-import pandas as pd
+# import pandas as pd
 import math, time
 import itertools
 from sklearn import preprocessing
@@ -11,6 +14,7 @@ import torch
 from torch import nn, optim
 from torch.autograd import Variable
 import torch.utils.data as data_utils
+from torch import manual_seed
 from torch.utils.data.dataset import Dataset
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error
@@ -21,6 +25,10 @@ from collections import defaultdict
 import joblib
 import gurobipy as gp
 from gurobipy import GRB
+
+# torch.autograd.set_detect_anomaly(True)
+
+manual_seed(1234)
 
 capacity = 100
 purchase_fee = 0.2
@@ -257,9 +265,25 @@ import ip_model_whole as ip_model_wholeFile
 from ip_model_whole import IPOfunc
 
 class Intopt:
-    def __init__(self, c, h, A, b, purchase_fee, compensation_fee, n_features, num_layers=5, smoothing=False, thr=0.1, max_iter=None, method=1, mu0=None,
-                 damping=0.5, target_size=targetNum, epochs=8, optimizer=optim.Adam,
+    def __init__(self, c, h, A, b, purchase_fee, compensation_fee, n_features,
+                 pretrain_epochs: Annotated[int, "Must be greater than 0"],
+                 train_epochs: Annotated[int, "Must be greater than 0"],
+                 num_layers=5, smoothing=False, thr=0.1, max_iter=None, method=1, mu0=None,
+                 damping=0.5, target_size=targetNum, optimizer=optim.Adam,
                  batch_size=itemNum, **hyperparams):
+        """
+
+        Parameters
+        ----------
+        pretrain_epochs: number of training epochs using the MSE as the loss function.
+        train_epochs: number of epochs using the post-hoc regret as the loss function.
+        epochs: total number of epochs (simply the sum of pretrain and train epochs).
+        """
+
+        assert pretrain_epochs >= 0, "pretrain_epochs must be greater than or equal 0"
+        assert train_epochs >= 0, "train_epochs must be greater than or equal 0"
+        assert train_epochs + pretrain_epochs >= 1, "Either train_epochs or pretrain_epochs must be greather than 0"
+
         self.c = c
         self.h = h
         self.A = A
@@ -280,7 +304,9 @@ class Intopt:
         self.optimizer = optimizer
         self.batch_size = batch_size
         self.hyperparams = hyperparams
-        self.epochs = epochs
+        self.pretrain_epochs = pretrain_epochs
+        self.train_epochs = train_epochs
+        self.epochs = pretrain_epochs + train_epochs
         # print("embedding size {} n_features {}".format(embedding_size, n_features))
 
 #        self.model = Net(n_features=n_features, target_size=target_size)
@@ -291,9 +317,17 @@ class Intopt:
 
         self.optimizer = optimizer(self.model.parameters(), **hyperparams)
 
-    def fit(self, feature, value):
+    def fit(self, dataset_features, dataset_values):
+        mse_history = []
+        regret_history = []
+
+        init_mse, init_post_hoc_regret, _ = self.val_loss(capacity, dataset_features, dataset_values)
+
+        print('Initial results: ')
+        print(f'MSE: {init_mse} | Post-hoc regret: {init_post_hoc_regret}')
+
         logging.info("Intopt")
-        train_df = MyCustomDataset(feature, value)
+        train_df = MyCustomDataset(dataset_features, dataset_values)
 
         criterion = nn.L1Loss(reduction='mean')  # nn.MSELoss(reduction='mean')
         grad_list = np.zeros(self.epochs)
@@ -301,25 +335,25 @@ class Intopt:
           total_loss = 0
 #          for parameters in self.model.parameters():
 #            print(parameters)
-          if e < 5:
+          if e < self.pretrain_epochs:
             #print('stage 1')
             train_dl = data_utils.DataLoader(train_df, batch_size=self.batch_size, shuffle=False)
             for feature, value in train_dl:
                 self.optimizer.zero_grad()
                 op = self.model(feature).squeeze()
-#                print(feature, value, op)
-#                print(feature.shape, value.shape, op.shape)
+    #                print(feature, value, op)
+    #                print(feature.shape, value.shape, op.shape)
                 # targetNum=1: torch.Size([10, 4096]) torch.Size([10]) torch.Size([10])
                 # targetNum=2: torch.Size([10, 4096]) torch.Size([10, 2]) torch.Size([10, 2])
-#                print(value, op)
-                
+    #                print(value, op)
+
                 loss = criterion(op, value)
                 total_loss += loss.item()
                 loss.backward()
                 self.optimizer.step()
             grad_list[e] = total_loss
             print("Epoch{} ::loss {} ->".format(e,total_loss))
-                
+            # self.val_loss(capacity, feature_train, value_train)
           else:
             #print('stage 2')
             train_dl = data_utils.DataLoader(train_df, batch_size=self.batch_size, shuffle=False)
@@ -331,15 +365,17 @@ class Intopt:
                 self.optimizer.zero_grad()
                 op = self.model(feature).squeeze()
                 while torch.min(op) <= 0 or torch.isnan(op).any() or torch.isinf(op).any():
+                    print('NN has been reinitialized')
                     self.optimizer.zero_grad()
 #                    self.model.__init__(self.n_features, self.target_size)
                     self.model = make_fc(num_layers=self.num_layers,num_features=self.n_features)
                     op = self.model(feature).squeeze()
-  
+                    mse_loss, post_hoc_regret, _ = self.val_loss(capacity, dataset_features, dataset_values)
+                    print(f'After reinitialization - MSE: {mse_loss} | post-hoc regret: {post_hoc_regret}')
+
                 price = np.zeros(itemNum)
                 for i in range(itemNum):
                     price[i] = self.c[i+num*itemNum]
-                    op[i] = op[i]
                     
                 c_torch = torch.from_numpy(price).float()
                 h_torch = torch.from_numpy(self.h).float()
@@ -383,7 +419,7 @@ class Intopt:
 #                print(newLoss)
 #                newLoss = - (x * c_torch).sum()
 #                loss = loss - (x * c_torch).sum()
-                loss = loss + newLoss
+                loss = loss.detach() + newLoss.detach()
                 batchCnt = batchCnt + 1
 #                print(loss)
 #                loss = torch.dot(-c_torch, x)
@@ -408,18 +444,24 @@ class Intopt:
 #                    self.optimizer.step()
                 num = num + 1
             grad_list[e] = total_loss/trainSize
-            print("Epoch{} ::loss {} ->".format(e,grad_list[e]))
-                
-          
+            print("Epoch{} ::train loss {} ->".format(e,grad_list[e]))
+
           logging.info("EPOCH Ends")
+
+          epoch_mse, epoch_post_hoc_regret, _ = self.val_loss(capacity, dataset_features, dataset_values)
+          print(f'Epoch: {e+1}: train MSE: {epoch_mse} | train post-hoc regret: {epoch_post_hoc_regret}')
+          mse_history.append(epoch_mse)
+          regret_history.append(epoch_post_hoc_regret)
+
           #print("Epoch{}".format(e))
 #          for param_group in self.optimizer.param_groups:
 #            print(param_group['lr'])
           if e > 1 and abs(grad_list[e] - grad_list[e-1]) <= 0.01:
             break
-            
 
-    def val_loss(self, cap, feature, value):
+        return grad_list, {'mse': mse_history, 'regret': regret_history}
+
+    def val_loss(self, cap, feature, value) -> Tuple[float, float, torch.Tensor]:
         valueTemp = value.numpy()
 #        test_instance = len(valueTemp) / self.batch_size
         test_instance = np.size(valueTemp, 0) / self.batch_size
@@ -428,7 +470,7 @@ class Intopt:
         real_obj = actual_obj(itemVal, cap, value[:, 1], n_instance=int(test_instance))
 #        print(np.sum(real_obj))
 
-        self.model.eval()
+        # self.model.eval()
         criterion = nn.L1Loss(reduction='mean')  # nn.MSELoss(reduction='sum')
         valid_df = MyCustomDataset(feature, value)
         valid_dl = data_utils.DataLoader(valid_df, batch_size=self.batch_size, shuffle=False)
@@ -439,10 +481,12 @@ class Intopt:
         predVal = torch.zeros((len, 2))
         
         num = 0
+        mse_loss = 0
         for feature, value in valid_dl:
-            op = self.model(feature).squeeze()
+            op = self.model(feature).squeeze().detach()
 #            print(op)
-            loss = criterion(op, value)
+            loss = criterion(op, value).item()
+            mse_loss += loss
 
             realWT = {}
             predWT = {}
@@ -459,15 +503,14 @@ class Intopt:
             corrrlst = correction_single_obj(realPrice, predPrice, cap, realWT, predWT)
             corr_obj_list.append(corrrlst)
             num = num + 1
-            
 
-        self.model.train()
+        post_hoc_regret  = np.mean(abs(np.array(corr_obj_list) - real_obj))
+
+        # self.model.train()
 #        print(corr_obj_list)
 #        print(corr_obj_list-real_obj)
 #        print(np.sum(corr_obj_list))
-#        return prediction_loss, abs(np.array(obj_list) - real_obj)
-        return abs(np.array(corr_obj_list) - real_obj), predVal
-
+        return mse_loss, post_hoc_regret , predVal
 
 #c_dataTemp = np.loadtxt('KS_c.txt')
 #c_data = c_dataTemp[:itemNum]
@@ -480,16 +523,19 @@ b_data = np.zeros(2)
 
 print("*** HSD ****")
 
-testTime = 1
+testTime = 5
 recordBest = np.zeros((1, testTime))
 stopCriterior = 15
 
+mse_exp_history = []
+regret_exp_history = []
+
 for testi in range(testTime):
-    print(testi)
+    print(f'Test #{testi}')
     
-    c_train = np.loadtxt('./data/train_prices/train_prices(' + str(testi) + ').txt')
-    x_train = np.loadtxt('./data/train_features/train_features(' + str(testi) + ').txt')
-    y_train1 = np.loadtxt('./data/train_prices/train_prices(' + str(testi) + ').txt')
+    c_train = np.loadtxt(f'./data/train_prices/train_prices({testi}).txt')
+    x_train = np.loadtxt('./data/train_features/train_features(0).txt')
+    y_train1 = np.loadtxt(f'./data/train_prices/train_prices({testi}).txt')
     y_train2 = np.loadtxt('./data/train_weights/train_weights(' + str(testi) + ').txt')
     meanPriceValue = np.mean(y_train1)
     meanWeightValue = np.mean(y_train2)
@@ -502,7 +548,7 @@ for testi in range(testTime):
     value_train = torch.from_numpy(y_train).float()
     
     c_test = np.loadtxt('./data/test_prices/test_prices(' + str(testi) + ').txt')
-    x_test = np.loadtxt('./data/test_features/test_features(' + str(testi) + ').txt')
+    x_test = np.loadtxt('./data/test_features/test_features(0).txt')
     y_test1 = np.loadtxt('./data/test_prices/test_prices(' + str(testi) + ').txt')
     y_test2 = np.loadtxt('./data/test_weights/test_weights(' + str(testi) + ').txt')
 
@@ -518,26 +564,36 @@ for testi in range(testTime):
     thr = 1e-3
     lr = 1e-5
     bestTrainCorrReg = float("inf")
-    for j in range(3):
-        clf = Intopt(c_train, h_data, A_data, b_data, purchase_fee, compensation_fee, damping=damping, lr=lr, n_features=featureNum, thr=thr, epochs=20)
-        clf.fit(feature_train, value_train)
-        train_rslt, predTrainVal = clf.val_loss(capacity, feature_train, value_train)
-        avgTrainCorrReg = np.mean(train_rslt)
-        trainHSD_rslt = 'train: ' + str(np.mean(train_rslt))
+    for j in range(1):
+        clf = Intopt(c_train, h_data, A_data, b_data, purchase_fee, compensation_fee, damping=damping, lr=lr, n_features=featureNum, thr=thr, pretrain_epochs=0, train_epochs=10)
+        _, history = clf.fit(feature_train, value_train)
+        mse_exp_history.append(history['mse'])
+        regret_exp_history.append(history['regret'])
 
-        if avgTrainCorrReg < bestTrainCorrReg:
-            bestTrainCorrReg = avgTrainCorrReg
+        with open(f'kp-capacity-{capacity}-mse-history.pkl', 'wb') as file:
+            pickle.dump(mse_exp_history, file)
+
+        with open(f'kp-capacity-{capacity}-regret-history.pkl', 'wb') as file:
+            pickle.dump(regret_exp_history, file)
+
+        train_mse, train_post_hoc_regret, predTrainVal = clf.val_loss(capacity, feature_train, value_train)
+        # avgTrainCorrReg = np.mean(train_rslt)
+        # trainHSD_rslt = 'train: ' + str(np.mean(train_rslt))
+
+        if train_post_hoc_regret < bestTrainCorrReg:
+            bestTrainCorrReg = train_post_hoc_regret
             torch.save(clf.model.state_dict(), 'model.pkl')
-        print(trainHSD_rslt)
+
+        print(f'Final result: {train_post_hoc_regret}')
         
-        if avgTrainCorrReg < stopCriterior:
+        if train_post_hoc_regret < stopCriterior:
             break
 
 
-    clfBest = Intopt(c_test, h_data, A_data, b_data, purchase_fee, compensation_fee, damping=damping, lr=lr, n_features=featureNum, thr=thr, epochs=8)
+    clfBest = Intopt(c_test, h_data, A_data, b_data, purchase_fee, compensation_fee, damping=damping, lr=lr, n_features=featureNum, thr=thr, train_epochs=1, pretrain_epochs=1)
     clfBest.model.load_state_dict(torch.load('model.pkl'))
 
-    val_rslt, predTestVal = clfBest.val_loss(capacity, feature_test, value_test)
+    val_mse, val_post_hoc_regret, predTestVal = clfBest.val_loss(capacity, feature_test, value_test)
     end = time.time()
 
     predTestVal = predTestVal.detach().numpy()
@@ -557,9 +613,9 @@ for testi in range(testTime):
         predValueWeight[i][1] = predTestVal2[i]
     np.savetxt('./data/2S_weights/2S_weights_cap' + str(capacity) + '_compensation' + str(compensation_fee) + '(' + str(testi) + ').txt', predValueWeight, fmt="%.2f")
     
-    HSD_rslt = 'test: ' + str(np.mean(val_rslt))
+    HSD_rslt = 'test: ' + str(val_post_hoc_regret)
     print(HSD_rslt)
     print ('Elapsed time: ' + str(end-start))
-    recordBest[0][testi] = np.sum(val_rslt)
+    print('\n' + '-'*50)
+    print()
 
-print(recordBest)

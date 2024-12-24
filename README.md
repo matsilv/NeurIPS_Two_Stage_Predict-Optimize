@@ -12,3 +12,5 @@ For example, to run the brass experiment in the alloy production problem:
 1.	Enter “./code/Alloy production” folder
 2.	Move all the files in the“./data/Alloy production/brass” folder into the “./code/Alloy production/data” folder and unzip all the data files
 3.	Run “python3 train.py”
+
+You can set the number of pretraining epochs (with MSE) and standard training epochs (post-hoc regret) by setting the parameters `pretrain_epochs` and `train_epochs` when initializing the `Intopt`.
