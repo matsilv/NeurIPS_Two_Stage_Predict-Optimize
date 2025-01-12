@@ -33,13 +33,14 @@ from gurobipy import GRB
 manual_seed(1234)
 
 # capacity = 100
-capacity = np.load('data/seed-0/capacity_n_1000_input_dim_5_output_dim_50_mult_noise_0.1_add_noise_0.03_deg_5_relative_capacity_0.2_correlation_type_1_rho_0.npy')
+capacity = np.load(
+    'data/synthetic/capacity_kp_50.npy')
 purchase_fee = 0.2
 compensation_fee = 0.21
 
 itemNum = 50
 featureNum = 5
-trainSize = 700
+trainSize = 1000
 targetNum = 2
 
 def get_xTrue(valueTemp, cap, weightTemp, n_instance):
@@ -135,11 +136,11 @@ def actual_obj(valueTemp, cap, weightTemp, n_instance):
     for num in range(n_instance):
         weight = np.zeros(itemNum)
         value = np.zeros(itemNum)
-        cnt = num * itemNum
+        # cnt = num * itemNum
         for i in range(itemNum):
-            weight[i] = weightTemp[cnt]
-            value[i] = valueTemp[cnt]
-            cnt = cnt + 1
+            weight[i] = weightTemp[num][i]
+            value[i] = valueTemp[num][i]
+            # cnt = cnt + 1
         weight = weight.tolist()
         value = value.tolist()
         
@@ -246,7 +247,7 @@ def make_fc(num_layers, num_features, num_targets=targetNum,
     for hidden in range(num_layers-2):
         net_layers.append(nn.Linear(intermediate_size, intermediate_size))
         net_layers.append(activation_fn())
-    net_layers.append(nn.Linear(intermediate_size, num_targets))
+    net_layers.append(nn.Linear(intermediate_size, itemNum * num_targets))
     net_layers.append(activation_fn())
     return nn.Sequential(*net_layers)
         
@@ -260,7 +261,7 @@ class MyCustomDataset():
         return len(self.feature)
 
     def __getitem__(self, idx):
-        return self.feature[idx], self.value[idx*itemNum:idx*itemNum + itemNum]
+        return self.feature[idx], self.value[idx]
 
 
 import sys
@@ -324,7 +325,7 @@ class Intopt:
         mse_history = []
         regret_history = []
 
-        init_mse, init_post_hoc_regret, _ = self.val_loss(capacity, dataset_features, dataset_values)
+        init_mse, init_post_hoc_regret = self.val_loss(capacity, dataset_features, dataset_values)
 
         print('Initial results: ')
         print(f'MSE: {init_mse} | Post-hoc regret: {init_post_hoc_regret}')
@@ -344,6 +345,7 @@ class Intopt:
             for feature, value in train_dl:
                 self.optimizer.zero_grad()
                 op = self.model(feature).squeeze()
+                op = torch.reshape(op, (itemNum, targetNum))
     #                print(feature, value, op)
     #                print(feature.shape, value.shape, op.shape)
                 # targetNum=1: torch.Size([10, 4096]) torch.Size([10]) torch.Size([10])
@@ -365,20 +367,26 @@ class Intopt:
             batchCnt = 0
             loss = Variable(torch.tensor(0.0, dtype=torch.double), requires_grad=True)
             for feature, value in train_dl:
+
+                value = torch.squeeze(value)
+
                 self.optimizer.zero_grad()
                 op = self.model(feature).squeeze()
-                while torch.min(op) <= 0 or torch.isnan(op).any() or torch.isinf(op).any():
-                    print('NN has been reinitialized')
+                op = torch.reshape(op, (itemNum, targetNum))
+                # while torch.min(op) <= 0 or torch.isnan(op).any() or torch.isinf(op).any():
+                while torch.isnan(op).any() or torch.isinf(op).any():
+                    # print('NN has been reinitialized')
                     self.optimizer.zero_grad()
 #                    self.model.__init__(self.n_features, self.target_size)
                     self.model = make_fc(num_layers=self.num_layers,num_features=self.n_features)
                     op = self.model(feature).squeeze()
-                    mse_loss, post_hoc_regret, _ = self.val_loss(capacity, dataset_features, dataset_values)
-                    print(f'After reinitialization - MSE: {mse_loss} | post-hoc regret: {post_hoc_regret}')
+                    op = torch.reshape(op, (itemNum, targetNum))
+                    # mse_loss, post_hoc_regret = self.val_loss(capacity, dataset_features, dataset_values)
+                    # print(f'After reinitialization - MSE: {mse_loss} | post-hoc regret: {post_hoc_regret}')
 
                 price = np.zeros(itemNum)
                 for i in range(itemNum):
-                    price[i] = self.c[i+num*itemNum]
+                    price[i] = np.squeeze(self.c[num][i])
                     
                 c_torch = torch.from_numpy(price).float()
                 h_torch = torch.from_numpy(self.h).float()
@@ -451,7 +459,7 @@ class Intopt:
 
           logging.info("EPOCH Ends")
 
-          epoch_mse, epoch_post_hoc_regret, _ = self.val_loss(capacity, dataset_features, dataset_values)
+          epoch_mse, epoch_post_hoc_regret = self.val_loss(capacity, dataset_features, dataset_values)
           print(f'Epoch: {e+1}: train MSE: {epoch_mse} | train post-hoc regret: {epoch_post_hoc_regret}')
           mse_history.append(epoch_mse)
           regret_history.append(epoch_post_hoc_regret)
@@ -464,13 +472,13 @@ class Intopt:
 
         return grad_list, {'mse': mse_history, 'regret': regret_history}
 
-    def val_loss(self, cap, feature, value) -> Tuple[float, float, torch.Tensor]:
+    def val_loss(self, cap, feature, value) -> Tuple[float, float]:
         valueTemp = value.numpy()
 #        test_instance = len(valueTemp) / self.batch_size
         test_instance = np.size(valueTemp, 0) / self.batch_size
 #        itemVal = self.c.tolist()
         itemVal = self.c
-        real_obj = actual_obj(itemVal, cap, value[:, 1], n_instance=int(test_instance))
+        real_obj = actual_obj(itemVal, cap, value[:, :,  1], n_instance=int(test_instance))
 #        print(np.sum(real_obj))
 
         # self.model.eval()
@@ -486,7 +494,9 @@ class Intopt:
         num = 0
         mse_loss = 0
         for feature, value in valid_dl:
+            value = torch.squeeze(value)
             op = self.model(feature).squeeze().detach()
+            op = torch.reshape(op, (itemNum, targetNum))
 #            print(op)
             loss = criterion(op, value).item()
             mse_loss += loss
@@ -500,8 +510,8 @@ class Intopt:
                 predWT[i] = op[i][1]
                 realPrice[i] = value[i][0]
                 predPrice[i] = op[i][0]
-                predVal[i+num*itemNum][0] = op[i][0]
-                predVal[i+num*itemNum][1] = op[i][1]
+                # predVal[num][0] = op[i][0]
+                # predVal[num][1] = op[i][1]
 
             corrrlst = correction_single_obj(realPrice, predPrice, cap, realWT, predWT)
             corr_obj_list.append(corrrlst)
@@ -513,7 +523,7 @@ class Intopt:
 #        print(corr_obj_list)
 #        print(corr_obj_list-real_obj)
 #        print(np.sum(corr_obj_list))
-        return mse_loss, post_hoc_regret , predVal
+        return mse_loss, post_hoc_regret
 
 #c_dataTemp = np.loadtxt('KS_c.txt')
 #c_data = c_dataTemp[:itemNum]
@@ -538,18 +548,20 @@ for testi in range(testTime):
 
     # x_train = np.loadtxt('./data/train_features/train_features(0).txt')
     x_train = pd.read_csv(
-        'data/seed-0/features_n_1000_input_dim_5_output_dim_50_mult_noise_0.1_add_noise_0.03_deg_5_relative_capacity_0.2_correlation_type_1_rho_0.csv',
+        'data/synthetic/features_kp_50.csv',
         index_col=0)
     x_train = x_train.values
     # c_train = np.loadtxt(f'./data/train_prices/train_prices({testi}).txt')
-    c_train = pd.read_csv('data/seed-0/values_n_1000_input_dim_5_output_dim_50_mult_noise_0.1_add_noise_0.03_deg_5_relative_capacity_0.2_correlation_type_1_rho_0.csv', index_col=0)
+    c_train = pd.read_csv(
+        'data/synthetic/values_kp_50.csv', index_col=0)
     c_train = c_train.values
     c_train = c_train.reshape(-1)
     c_train = np.tile(c_train, x_train.shape[0])
     # y_train1 = np.loadtxt(f'./data/train_prices/train_prices({testi}).txt')
     # y_train2 = np.loadtxt('./data/train_weights/train_weights(' + str(testi) + ').txt')
     y_train1 = c_train.copy()
-    y_train2 = pd.read_csv('data/seed-0/targets_n_1000_input_dim_5_output_dim_50_mult_noise_0.1_add_noise_0.03_deg_5_relative_capacity_0.2_correlation_type_1_rho_0.csv', index_col=0)
+    y_train2 = pd.read_csv(
+        'data/synthetic/targets_kp_50.csv', index_col=0)
     y_train2 = y_train2.values
     y_train2 = y_train2.reshape(-1)
 
@@ -562,6 +574,8 @@ for testi in range(testTime):
         y_train[i][1] = y_train2[i]
     feature_train = torch.from_numpy(x_train).float()
     value_train = torch.from_numpy(y_train).float()
+    value_train = value_train.reshape(trainSize, itemNum, targetNum)
+    c_train = c_train.reshape(trainSize, itemNum, 1)
     
     # c_test = np.loadtxt('./data/test_prices/test_prices(' + str(testi) + ').txt')
     # x_test = np.loadtxt('./data/test_features/test_features(0).txt')
@@ -588,7 +602,15 @@ for testi in range(testTime):
     lr = 1e-5
     bestTrainCorrReg = float("inf")
     for j in range(1):
-        clf = Intopt(c_train, h_data, A_data, b_data, purchase_fee, compensation_fee, damping=damping, lr=lr, n_features=featureNum, thr=thr, pretrain_epochs=0, train_epochs=10)
+        clf = (
+            Intopt(c_train, h_data, A_data, b_data, purchase_fee, compensation_fee,
+                   damping=damping,
+                   lr=lr,
+                   n_features=featureNum,
+                   thr=thr,
+                   pretrain_epochs=0,
+                   train_epochs=10,
+                   batch_size=1))
         _, history = clf.fit(feature_train, value_train)
         mse_exp_history.append(history['mse'])
         regret_exp_history.append(history['regret'])
@@ -599,7 +621,7 @@ for testi in range(testTime):
         with open(f'kp-capacity-{capacity}-regret-history.pkl', 'wb') as file:
             pickle.dump(regret_exp_history, file)
 
-        train_mse, train_post_hoc_regret, predTrainVal = clf.val_loss(capacity, feature_train, value_train)
+        train_mse, train_post_hoc_regret = clf.val_loss(capacity, feature_train, value_train)
         # avgTrainCorrReg = np.mean(train_rslt)
         # trainHSD_rslt = 'train: ' + str(np.mean(train_rslt))
 
@@ -616,7 +638,7 @@ for testi in range(testTime):
     clfBest = Intopt(c_test, h_data, A_data, b_data, purchase_fee, compensation_fee, damping=damping, lr=lr, n_features=featureNum, thr=thr, train_epochs=1, pretrain_epochs=1)
     clfBest.model.load_state_dict(torch.load('model.pkl'))
 
-    val_mse, val_post_hoc_regret, predTestVal = clfBest.val_loss(capacity, feature_test, value_test)
+    val_mse, val_post_hoc_regret = clfBest.val_loss(capacity, feature_test, value_test)
     end = time.time()
 
 #     predTestVal = predTestVal.detach().numpy()

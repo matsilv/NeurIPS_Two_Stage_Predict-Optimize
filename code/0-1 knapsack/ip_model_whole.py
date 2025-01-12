@@ -21,7 +21,7 @@ from gurobipy import GRB
 
 #purchase_fee = 0.2
 #compensation_fee = 0.25
-varNum = 10
+varNum = 50
 x_s1 = torch.zeros(varNum,dtype=torch.float64)
 
 def _format_A_constraints(A, n_x, sparse_lhs=False):
