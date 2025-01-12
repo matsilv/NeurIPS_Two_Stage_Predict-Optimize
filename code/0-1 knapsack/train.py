@@ -7,6 +7,8 @@ import random
 # import pandas as pd
 import math, time
 import itertools
+
+import pandas as pd
 from sklearn import preprocessing
 from sklearn.preprocessing import MinMaxScaler
 import datetime
@@ -30,12 +32,13 @@ from gurobipy import GRB
 
 manual_seed(1234)
 
-capacity = 100
+# capacity = 100
+capacity = np.load('data/seed-0/capacity_n_1000_input_dim_5_output_dim_50_mult_noise_0.1_add_noise_0.03_deg_5_relative_capacity_0.2_correlation_type_1_rho_0.npy')
 purchase_fee = 0.2
 compensation_fee = 0.21
 
-itemNum = 10
-featureNum = 4096
+itemNum = 50
+featureNum = 5
 trainSize = 700
 targetNum = 2
 
@@ -254,10 +257,10 @@ class MyCustomDataset():
         self.value = value
 
     def __len__(self):
-        return len(self.value)
+        return len(self.feature)
 
     def __getitem__(self, idx):
-        return self.feature[idx], self.value[idx]
+        return self.feature[idx], self.value[idx*itemNum:idx*itemNum + itemNum]
 
 
 import sys
@@ -472,8 +475,8 @@ class Intopt:
 
         # self.model.eval()
         criterion = nn.L1Loss(reduction='mean')  # nn.MSELoss(reduction='sum')
-        valid_df = MyCustomDataset(feature, value)
-        valid_dl = data_utils.DataLoader(valid_df, batch_size=self.batch_size, shuffle=False)
+        valid_df = MyCustomDataset(value=value, feature=feature)
+        valid_dl = data_utils.DataLoader(valid_df, batch_size=1, shuffle=False)
 
         obj_list = []
         corr_obj_list = []
@@ -532,12 +535,25 @@ regret_exp_history = []
 
 for testi in range(testTime):
     print(f'Test #{testi}')
-    
-    c_train = np.loadtxt(f'./data/train_prices/train_prices({testi}).txt')
-    x_train = np.loadtxt('./data/train_features/train_features(0).txt')
-    y_train1 = np.loadtxt(f'./data/train_prices/train_prices({testi}).txt')
-    y_train2 = np.loadtxt('./data/train_weights/train_weights(' + str(testi) + ').txt')
-    meanPriceValue = np.mean(y_train1)
+
+    # x_train = np.loadtxt('./data/train_features/train_features(0).txt')
+    x_train = pd.read_csv(
+        'data/seed-0/features_n_1000_input_dim_5_output_dim_50_mult_noise_0.1_add_noise_0.03_deg_5_relative_capacity_0.2_correlation_type_1_rho_0.csv',
+        index_col=0)
+    x_train = x_train.values
+    # c_train = np.loadtxt(f'./data/train_prices/train_prices({testi}).txt')
+    c_train = pd.read_csv('data/seed-0/values_n_1000_input_dim_5_output_dim_50_mult_noise_0.1_add_noise_0.03_deg_5_relative_capacity_0.2_correlation_type_1_rho_0.csv', index_col=0)
+    c_train = c_train.values
+    c_train = c_train.reshape(-1)
+    c_train = np.tile(c_train, x_train.shape[0])
+    # y_train1 = np.loadtxt(f'./data/train_prices/train_prices({testi}).txt')
+    # y_train2 = np.loadtxt('./data/train_weights/train_weights(' + str(testi) + ').txt')
+    y_train1 = c_train.copy()
+    y_train2 = pd.read_csv('data/seed-0/targets_n_1000_input_dim_5_output_dim_50_mult_noise_0.1_add_noise_0.03_deg_5_relative_capacity_0.2_correlation_type_1_rho_0.csv', index_col=0)
+    y_train2 = y_train2.values
+    y_train2 = y_train2.reshape(-1)
+
+    meanPriceValue = np.mean(c_train)
     meanWeightValue = np.mean(y_train2)
 
     y_train = np.zeros((y_train1.size, 2))
@@ -547,15 +563,22 @@ for testi in range(testTime):
     feature_train = torch.from_numpy(x_train).float()
     value_train = torch.from_numpy(y_train).float()
     
-    c_test = np.loadtxt('./data/test_prices/test_prices(' + str(testi) + ').txt')
-    x_test = np.loadtxt('./data/test_features/test_features(0).txt')
-    y_test1 = np.loadtxt('./data/test_prices/test_prices(' + str(testi) + ').txt')
-    y_test2 = np.loadtxt('./data/test_weights/test_weights(' + str(testi) + ').txt')
+    # c_test = np.loadtxt('./data/test_prices/test_prices(' + str(testi) + ').txt')
+    # x_test = np.loadtxt('./data/test_features/test_features(0).txt')
+    # y_test1 = np.loadtxt('./data/test_prices/test_prices(' + str(testi) + ').txt')
+    # y_test2 = np.loadtxt('./data/test_weights/test_weights(' + str(testi) + ').txt')
 
-    y_test = np.zeros((y_test1.size, 2))
-    for i in range(y_test1.size):
-        y_test[i][0] = y_test1[i]
-        y_test[i][1] = y_test2[i]
+    c_test = c_train.copy()
+    x_test = x_train.copy()
+    y_test2 = y_train2.copy()
+
+    # y_test = np.zeros((y_test1.size, 2))
+    # for i in range(y_test1.size):
+    #     y_test[i][0] = y_test1[i]
+    #     y_test[i][1] = y_test2[i]
+
+    y_test = y_train.copy()
+
     feature_test = torch.from_numpy(x_test).float()
     value_test = torch.from_numpy(y_test).float()
     
@@ -596,22 +619,22 @@ for testi in range(testTime):
     val_mse, val_post_hoc_regret, predTestVal = clfBest.val_loss(capacity, feature_test, value_test)
     end = time.time()
 
-    predTestVal = predTestVal.detach().numpy()
-#    print(predTestVal.shape)
-    predTestVal1 = predTestVal[:, 0]
-    predTestVal2 = predTestVal[:, 1]
-    predValuePrice = np.zeros((predTestVal1.size, 2))
-    for i in range(predTestVal1.size):
-#        predValue[i][0] = int(i/itemNum)
-        predValuePrice[i][0] = y_test1[i]
-        predValuePrice[i][1] = predTestVal1[i]
-    np.savetxt('./data/2S_prices/2S_prices_cap' + str(capacity) + '_compensation' + str(compensation_fee) + '(' + str(testi) + ').txt', predValuePrice, fmt="%.2f")
-    predValueWeight = np.zeros((predTestVal2.size, 2))
-    for i in range(predTestVal2.size):
-#        predValue[i][0] = int(i/itemNum)
-        predValueWeight[i][0] = y_test2[i]
-        predValueWeight[i][1] = predTestVal2[i]
-    np.savetxt('./data/2S_weights/2S_weights_cap' + str(capacity) + '_compensation' + str(compensation_fee) + '(' + str(testi) + ').txt', predValueWeight, fmt="%.2f")
+#     predTestVal = predTestVal.detach().numpy()
+# #    print(predTestVal.shape)
+#     predTestVal1 = predTestVal[:, 0]
+#     predTestVal2 = predTestVal[:, 1]
+#     predValuePrice = np.zeros((predTestVal1.size, 2))
+#     for i in range(predTestVal1.size):
+# #        predValue[i][0] = int(i/itemNum)
+#         predValuePrice[i][0] = y_test1[i]
+#         predValuePrice[i][1] = predTestVal1[i]
+#     np.savetxt('./data/2S_prices/2S_prices_cap' + str(capacity) + '_compensation' + str(compensation_fee) + '(' + str(testi) + ').txt', predValuePrice, fmt="%.2f")
+#     predValueWeight = np.zeros((predTestVal2.size, 2))
+#     for i in range(predTestVal2.size):
+# #        predValue[i][0] = int(i/itemNum)
+#         predValueWeight[i][0] = y_test2[i]
+#         predValueWeight[i][1] = predTestVal2[i]
+#     np.savetxt('./data/2S_weights/2S_weights_cap' + str(capacity) + '_compensation' + str(compensation_fee) + '(' + str(testi) + ').txt', predValueWeight, fmt="%.2f")
     
     HSD_rslt = 'test: ' + str(val_post_hoc_regret)
     print(HSD_rslt)
