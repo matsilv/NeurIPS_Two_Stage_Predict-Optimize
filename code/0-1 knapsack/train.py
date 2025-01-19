@@ -1,32 +1,19 @@
 import pickle
-import sys
-from typing import Tuple, Annotated
+from typing import Tuple, Annotated, Literal
 
 import numpy as np
-import random
-# import pandas as pd
-import math, time
-import itertools
+import time
 
 import pandas as pd
-from sklearn import preprocessing
-from sklearn.preprocessing import MinMaxScaler
-import datetime
 import torch
 from torch import nn, optim
 from torch.autograd import Variable
 import torch.utils.data as data_utils
 from torch import manual_seed
-from torch.utils.data.dataset import Dataset
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error
-import gurobipy as gp
 import logging
-import copy
-from collections import defaultdict
-import joblib
 import gurobipy as gp
 from gurobipy import GRB
+from utils import correction_single_obj
 
 # torch.autograd.set_detect_anomaly(True)
 
@@ -137,6 +124,7 @@ def actual_obj(valueTemp, cap, weightTemp, n_instance):
         weight = np.zeros(itemNum)
         value = np.zeros(itemNum)
         # cnt = num * itemNum
+        # TODO: check
         for i in range(itemNum):
             weight[i] = weightTemp[num][i]
             value[i] = valueTemp[num][i]
@@ -167,67 +155,6 @@ def actual_obj(valueTemp, cap, weightTemp, n_instance):
         
     return np.array(obj_list)
 
-
-def correction_single_obj(realPrice, predPrice, cap, realWeightTemp, predWeightTemp):
-#    print("realPrice: ", realPrice, "predPrice: ", predPrice)
-    realWeight = np.zeros(itemNum)
-    predWeight = np.zeros(itemNum)
-    realPriceNumpy = np.zeros(itemNum)
-    for i in range(itemNum):
-        realWeight[i] = realWeightTemp[i]
-        predWeight[i] = predWeightTemp[i]
-        realPriceNumpy[i] = realPrice[i]
-        
-    if min(predWeight) >= 0:
-        predWeight = predWeight.tolist()
-        m = gp.Model()
-        m.setParam('OutputFlag', 0)
-        x = m.addVars(itemNum, vtype=GRB.BINARY, name='x')
-        m.setObjective(purchase_fee * x.prod(predPrice), GRB.MAXIMIZE)
-        m.addConstr((x.prod(predWeight)) <= cap)
-
-        m.optimize()
-        predSol = np.zeros(itemNum,dtype='i')
-        x1_selectedItemNum = 0
-        for i in range(itemNum):
-            predSol[i] = x[i].x
-            if x[i].x == 1:
-              x1_selectedItemNum = x1_selectedItemNum + 1
-        objective1 = m.objVal
-#        print("Stage 1: ", predSol, objective1)
-
-        # Stage 2:
-        realWeight = realWeight.tolist()
-        m2 = gp.Model()
-        m2.setParam('OutputFlag', 0)
-        x = m2.addVars(itemNum, vtype=GRB.BINARY, name='x')
-        sigma = m2.addVars(itemNum, vtype=GRB.BINARY, name='sigma')
-
-        OBJ = purchase_fee * x.prod(realPrice)
-        for i in range(itemNum):
-            OBJ = OBJ - compensation_fee * realPrice[i] * sigma[i]
-        m2.setObjective(OBJ, GRB.MAXIMIZE)
-
-        m2.addConstr((x.prod(realWeight) - sigma.prod(realWeight)) <= cap)
-        for i in range(itemNum):
-            m2.addConstr(x[i] == predSol[i])
-            m2.addConstr(x[i] >= sigma[i])
-        
-        try:
-            m2.optimize()
-            objective = m2.objVal
-            sol = []
-            x2_selectedItemNum = 0
-            for i in range(itemNum):
-                sol.append(x[i].x - sigma[i].x)
-                if x[i].x - sigma[i].x == 1:
-                  x2_selectedItemNum = x2_selectedItemNum + 1
-    #        print("Stage 2: ", sol, objective)
-        except:
-            print(predPrice, predWeight, realPrice, realWeight, predSol)
-
-    return objective
-
     
 def weight_init(m):
     if isinstance(m, nn.Linear):
@@ -241,12 +168,23 @@ def weight_init(m):
         nn.init.constant_(m.weight, 1)
         nn.init.constant_(m.bias, 0)
         
-def make_fc(num_layers, num_features, num_targets=targetNum,
+def make_fc(num_layers, num_features,
+            # num_target must be 1 or 2. If 1, we either predict the costs or weights. If 2, we predict both the costs
+            # and weights.
+            num_targets: Literal[1, 2] = targetNum,
             activation_fn = nn.ReLU,intermediate_size=512, regularizers = True):
+
+    error_msg = ('num_target must be 1 or 2. If 1, we either predict the costs or weights. If 2, we predict both the '
+                 'costs and weights.')
+    assert num_targets in {1, 2}, error_msg
+
     net_layers = [nn.Linear(num_features, intermediate_size),activation_fn()]
     for hidden in range(num_layers-2):
         net_layers.append(nn.Linear(intermediate_size, intermediate_size))
         net_layers.append(activation_fn())
+    # In the original version, the number of output units was 2. They basically predict the cost and weight for item
+    # independently. To align with our implementation, we predict the joinly predict the cost and weight for all the
+    # items.
     net_layers.append(nn.Linear(intermediate_size, itemNum * num_targets))
     net_layers.append(activation_fn())
     return nn.Sequential(*net_layers)
@@ -260,7 +198,16 @@ class MyCustomDataset():
     def __len__(self):
         return len(self.feature)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+
+
+        Returns
+        -------
+        A tuple with two torch.Tensor, the feature and target vectors. The feature vector has shape
+        (n_examples, n_fetures). The target vector has shape (n_examples, n_items, n_targets), where n_targets must be 1
+        or 2. If 1, the target is either the cost or weight array. If 2, the target are both the cost and weight arrays.
+        """
         return self.feature[idx], self.value[idx]
 
 
@@ -345,6 +292,7 @@ class Intopt:
             for feature, value in train_dl:
                 self.optimizer.zero_grad()
                 op = self.model(feature).squeeze()
+                # TODO: check
                 op = torch.reshape(op, (itemNum, targetNum))
     #                print(feature, value, op)
     #                print(feature.shape, value.shape, op.shape)
@@ -373,8 +321,9 @@ class Intopt:
                 self.optimizer.zero_grad()
                 op = self.model(feature).squeeze()
                 op = torch.reshape(op, (itemNum, targetNum))
-                # while torch.min(op) <= 0 or torch.isnan(op).any() or torch.isinf(op).any():
-                while torch.isnan(op).any() or torch.isinf(op).any():
+                # FIXME: this might lead to infinite loop.
+                while torch.min(op) <= 0 or torch.isnan(op).any() or torch.isinf(op).any():
+                # while torch.isnan(op).any() or torch.isinf(op).any():
                     # print('NN has been reinitialized')
                     self.optimizer.zero_grad()
 #                    self.model.__init__(self.n_features, self.target_size)
@@ -386,6 +335,7 @@ class Intopt:
 
                 price = np.zeros(itemNum)
                 for i in range(itemNum):
+                    # TODO: check
                     price[i] = np.squeeze(self.c[num][i])
                     
                 c_torch = torch.from_numpy(price).float()
@@ -472,13 +422,21 @@ class Intopt:
 
         return grad_list, {'mse': mse_history, 'regret': regret_history}
 
+    # TODO: check
     def val_loss(self, cap, feature, value) -> Tuple[float, float]:
         valueTemp = value.numpy()
 #        test_instance = len(valueTemp) / self.batch_size
         test_instance = np.size(valueTemp, 0) / self.batch_size
 #        itemVal = self.c.tolist()
         itemVal = self.c
-        real_obj = actual_obj(itemVal, cap, value[:, :,  1], n_instance=int(test_instance))
+        # Cost of the true optimal solutions.
+        real_obj = (
+            actual_obj(valueTemp=itemVal,
+                       cap=cap,
+                       # The element on index 1 in the target array is the weight array.
+                       weightTemp=value[:, :,  1],
+                       n_instance=int(test_instance))
+        )
 #        print(np.sum(real_obj))
 
         # self.model.eval()
@@ -494,6 +452,7 @@ class Intopt:
         num = 0
         mse_loss = 0
         for feature, value in valid_dl:
+            # Remove the fake batch dimension.
             value = torch.squeeze(value)
             op = self.model(feature).squeeze().detach()
             op = torch.reshape(op, (itemNum, targetNum))
@@ -513,7 +472,14 @@ class Intopt:
                 # predVal[num][0] = op[i][0]
                 # predVal[num][1] = op[i][1]
 
-            corrrlst = correction_single_obj(realPrice, predPrice, cap, realWT, predWT)
+            corrrlst, _ = (
+                correction_single_obj(realPrice,
+                                      predPrice,
+                                      cap,
+                                      realWT,
+                                      predWT,
+                                      penalty=purchase_fee,
+                                      item_num=itemNum))
             corr_obj_list.append(corrrlst)
             num = num + 1
 
@@ -555,7 +521,10 @@ for testi in range(testTime):
     c_train = pd.read_csv(
         'data/synthetic/values_kp_50.csv', index_col=0)
     c_train = c_train.values
-    c_train = c_train.reshape(-1)
+    # c_train has shape (n_items, 1). We replace the fake additional dimension (on axis 1) and repeat the
+    # array for each training examples. The final shape is (n_examples * n_items).
+    # TODO: why this shape?
+    c_train = np.squeeze(c_train)
     c_train = np.tile(c_train, x_train.shape[0])
     # y_train1 = np.loadtxt(f'./data/train_prices/train_prices({testi}).txt')
     # y_train2 = np.loadtxt('./data/train_weights/train_weights(' + str(testi) + ').txt')
@@ -563,17 +532,22 @@ for testi in range(testTime):
     y_train2 = pd.read_csv(
         'data/synthetic/targets_kp_50.csv', index_col=0)
     y_train2 = y_train2.values
+    # Similarly as for c_train, we build a weights array with shape(n_examples * n_itmes).
+    # TODO: why this shape?
     y_train2 = y_train2.reshape(-1)
 
     meanPriceValue = np.mean(c_train)
     meanWeightValue = np.mean(y_train2)
 
+    # We build a target array of shape (n_examples * n_items, 2), where index 0 (on axis 1) refers to the cost and index
+    # 1 (on axis 1) refers to the weights.
     y_train = np.zeros((y_train1.size, 2))
     for i in range(y_train1.size):
         y_train[i][0] = y_train1[i]
         y_train[i][1] = y_train2[i]
     feature_train = torch.from_numpy(x_train).float()
     value_train = torch.from_numpy(y_train).float()
+    # TODO: check
     value_train = value_train.reshape(trainSize, itemNum, targetNum)
     c_train = c_train.reshape(trainSize, itemNum, 1)
     
@@ -602,6 +576,7 @@ for testi in range(testTime):
     lr = 1e-5
     bestTrainCorrReg = float("inf")
     for j in range(1):
+        # TODO: check
         clf = (
             Intopt(c_train, h_data, A_data, b_data, purchase_fee, compensation_fee,
                    damping=damping,
@@ -610,6 +585,9 @@ for testi in range(testTime):
                    thr=thr,
                    pretrain_epochs=0,
                    train_epochs=10,
+                   # In the original version the batch size is the number of items, since the dataset has shape
+                   # (n_examples * n_items). They use the batch size to group together features and targets for the same
+                   # example. The actual batch size (in its more general meaning) is 1.
                    batch_size=1))
         _, history = clf.fit(feature_train, value_train)
         mse_exp_history.append(history['mse'])
