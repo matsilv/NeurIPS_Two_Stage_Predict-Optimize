@@ -472,15 +472,16 @@ class Intopt:
                 # predVal[num][0] = op[i][0]
                 # predVal[num][1] = op[i][1]
 
-            corrrlst, _ = (
+            opt_res = (
                 correction_single_obj(realPrice,
                                       predPrice,
                                       cap,
                                       realWT,
                                       predWT,
-                                      penalty=purchase_fee,
+                                      purchase_fee=purchase_fee,
+                                      compensation_fee=compensation_fee,
                                       item_num=itemNum))
-            corr_obj_list.append(corrrlst)
+            corr_obj_list.append(opt_res.obj)
             num = num + 1
 
         post_hoc_regret  = np.mean(abs(np.array(corr_obj_list) - real_obj))

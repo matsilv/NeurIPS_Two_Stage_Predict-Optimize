@@ -2,12 +2,19 @@ from abc import abstractmethod
 import torch
 import numpy as np
 import gurobipy as gp
+from pydantic import BaseModel
 
 from typing import Tuple, Union, Dict, List
 
 PROBLEM_ID = 'stochastic_weights_kp'
 VALUES_STR = 'values'
 CAPACITY_STR = 'capacity'
+
+
+class OptimizationResults(BaseModel):
+    obj: float
+    first_stage_sol: List[int]
+    second_stage_sol: List[int]
 
 
 class OptimizationProblem:
@@ -88,20 +95,17 @@ class StochasticWeightsKnapsackProblem(OptimizationProblem):
     A class representing a knapsack problem in which the item weights are parameterized.
     """
 
-    def __init__(self, dim: int, penalty: float):
+    def __init__(self, dim: int, purchase_fee: float, compensation_fee: float):
         """
         :param dim: int; the KP dimension.
-        :param penalty: float; penalty for the recourse action.
         """
-
-        assert penalty >= 1, "Penalty must be greater than 1, otherwise there is no benefit in preventing the " \
-                             "recourse action"
 
         self._obj_type = 'nonlinear'
         self._is_minimization_problem = False
         self._name = PROBLEM_ID
         self._dim = dim
-        self._penalty = penalty
+        self._purchase_fee = purchase_fee
+        self._compensation_fee = compensation_fee
 
     @property
     def obj_type(self) -> str:
@@ -151,8 +155,8 @@ class StochasticWeightsKnapsackProblem(OptimizationProblem):
 
         return values, capacity
 
-    @staticmethod
-    def _first_stage_value(values: Union[np.ndarray, torch.Tensor],
+    def _first_stage_value(self,
+                           values: Union[np.ndarray, torch.Tensor],
                            first_stage_sol: Union[np.ndarray, torch.Tensor, gp.MVar]) -> Union[gp.LinExpr, float]:
         """
         Compute the first stage value. It is simply the matrix multiplication between the item values and the
@@ -165,11 +169,10 @@ class StochasticWeightsKnapsackProblem(OptimizationProblem):
         if isinstance(values, torch.Tensor):
             values = values.detach().numpy()
 
-        return values @ first_stage_sol
+        return self._purchase_fee * values @ first_stage_sol
 
     def _second_stage_value(self,
                             values: Union[np.ndarray, torch.Tensor],
-                            snd_stage_selected: Union[np.ndarray, torch.Tensor, gp.MVar],
                             snd_stage_removed: Union[np.ndarray, torch.Tensor, gp.MVar]) -> Union[gp.LinExpr, float]:
         """
         Compute the second-stage value. Items selected during second-stage have a lower value. Removing items during
@@ -182,7 +185,7 @@ class StochasticWeightsKnapsackProblem(OptimizationProblem):
         if isinstance(values, torch.Tensor):
             values = values.detach().numpy()
 
-        return 1 / self._penalty * values @ snd_stage_selected - self._penalty * values @ snd_stage_removed
+        return - self._compensation_fee * values @ snd_stage_removed
 
     def solve(self,
               y: np.ndarray,
@@ -199,7 +202,7 @@ class StochasticWeightsKnapsackProblem(OptimizationProblem):
 
         values, capacity = self._convert_opt_prob_params(opt_prob_params)
 
-        y = np.round(y, decimals=0)
+        # y = np.round(y, decimals=0)
         weights = y
 
         # Create the Gurobi model
@@ -228,9 +231,6 @@ class StochasticWeightsKnapsackProblem(OptimizationProblem):
 
             # Second-stage decisions
             # Selected items
-            u_plus = [model.addMVar(shape=self._dim,
-                                    vtype=gp.GRB.BINARY,
-                                    name=f"u_plus_{omega}") for omega in range(num_scenarios)]
             # Removed items
             u_minus = [model.addMVar(shape=self._dim,
                                      vtype=gp.GRB.BINARY,
@@ -243,19 +243,14 @@ class StochasticWeightsKnapsackProblem(OptimizationProblem):
             for omega in range(num_scenarios):
 
                 # Packing constraints
-                selected_items_capacity = weights[omega] @ x + \
-                                          weights[omega] @ u_plus[omega] - \
-                                          weights[omega] @ u_minus[omega]
+                selected_items_capacity = weights[omega] @ x - weights[omega] @ u_minus[omega]
                 model.addConstr(selected_items_capacity <= capacity, name=f"packing_constraints_{omega}")
 
                 # We can only remove already selected items
                 model.addConstr(x >= u_minus[omega])
 
-                # We can only add items that have not been selected during first-stage
-                model.addConstr(x + u_plus[omega] <= 1)
-
                 # Update the second-stage value
-                second_stage_value += self._second_stage_value(values, u_plus[omega], u_minus[omega])
+                second_stage_value += self._second_stage_value(values, u_minus[omega])
 
             second_stage_value = 1/num_scenarios * second_stage_value
 
@@ -275,7 +270,7 @@ class StochasticWeightsKnapsackProblem(OptimizationProblem):
     def get_objective_values(self,
                              y: torch.Tensor,
                              sols: torch.Tensor,
-                             opt_prob_params) -> Tuple[float, bool]:
+                             opt_prob_params) -> OptimizationResults:
         """
         Compute the objective value given the predictions and the solution.
         :param y: torch.Tensor; the item weights.
@@ -300,22 +295,17 @@ class StochasticWeightsKnapsackProblem(OptimizationProblem):
         # FIXME: repeating the second-stage optimization problem definition is error-prone: we must ensure it is the
         #  same as the one defined in the "solve" method.
         # Second-stage decisions
-        # Selected items
-        u_plus = model.addMVar(shape=self._dim, vtype=gp.GRB.BINARY, name="u_plus")
         # Removed items
         u_minus = model.addMVar(shape=self._dim, vtype=gp.GRB.BINARY, name="u_minus")
 
         # Second-stage constraints
-        model.addConstr(y @ sols + y @ u_plus - y @ u_minus <= capacity, name=f"packing constraints")
+        model.addConstr(y @ sols - y @ u_minus <= capacity, name=f"packing constraints")
 
         # We can only remove already selected items
         model.addConstr(sols >= u_minus)
 
-        # We can only add items that have not been selected during first-stage
-        model.addConstr(sols + u_plus <= 1)
-
         # Define the objective function
-        tot_value = self._first_stage_value(values, sols) + self._second_stage_value(values, u_plus, u_minus)
+        tot_value = self._first_stage_value(values, sols) + self._second_stage_value(values, u_minus)
         model.setObjective(tot_value, gp.GRB.MAXIMIZE)
 
         # Solve the model
@@ -325,7 +315,7 @@ class StochasticWeightsKnapsackProblem(OptimizationProblem):
         assert model.status == gp.GRB.OPTIMAL
 
         suboptimality_cost = self._first_stage_value(values, sols)
-        penalty_cost = self._second_stage_value(values, u_plus.x, u_minus.x)
+        penalty_cost = self._second_stage_value(values, u_minus.x)
 
         if penalty_cost != 0:
             feasible = False
@@ -336,7 +326,13 @@ class StochasticWeightsKnapsackProblem(OptimizationProblem):
         # and the ration of feasible solutions
         cost = suboptimality_cost + penalty_cost
 
-        return cost, feasible
+        res = (
+            OptimizationResults(obj=cost,
+                                first_stage_sol=[_x for _x in sols],
+                                second_stage_sol=[_x.x for _x in u_minus])
+        )
+
+        return res
 
 
 def correction_single_obj(realPrice,
@@ -344,8 +340,9 @@ def correction_single_obj(realPrice,
                           cap,
                           realWeightTemp,
                           predWeightTemp,
-                          penalty: float,
-                          item_num: int) -> Tuple[float, List[int]]:
+                          purchase_fee: float,
+                          compensation_fee: float,
+                          item_num: int) -> OptimizationResults:
 
     objective = None
     sol = []
@@ -359,59 +356,61 @@ def correction_single_obj(realPrice,
         predWeight[i] = predWeightTemp[i]
         realPriceNumpy[i] = realPrice[i]
 
-    # Why should we ignore solutions for negative weights?
     # if min(predWeight) >= 0:
     predWeight = predWeight.tolist()
-
-    # Stage 1:
     m = gp.Model()
     m.setParam('OutputFlag', 0)
     x = m.addVars(item_num, vtype=gp.GRB.BINARY, name='x')
-    # m.setObjective(purchase_fee * x.prod(predPrice), GRB.MAXIMIZE)
-    m.setObjective(x.prod(predPrice), gp.GRB.MAXIMIZE)
+    m.setObjective(purchase_fee * x.prod(predPrice), gp.GRB.MAXIMIZE)
     m.addConstr((x.prod(predWeight)) <= cap)
 
     m.optimize()
-    predSol = np.zeros(item_num,dtype='i')
-    x1_selecteditem_num = 0
+    predSol = np.zeros(item_num, dtype='i')
+    x1_selectedItemNum = 0
     for i in range(item_num):
         predSol[i] = x[i].x
         if x[i].x == 1:
-          x1_selecteditem_num = x1_selecteditem_num + 1
+            x1_selectedItemNum = x1_selectedItemNum + 1
     objective1 = m.objVal
-#        print("Stage 1: ", predSol, objective1)
+    #        print("Stage 1: ", predSol, objective1)
 
     # Stage 2:
     realWeight = realWeight.tolist()
     m2 = gp.Model()
     m2.setParam('OutputFlag', 0)
     x = m2.addVars(item_num, vtype=gp.GRB.BINARY, name='x')
-    snd_stage_removed = m2.addVars(item_num, vtype=gp.GRB.BINARY, name='2nd_stage_removed')
-    snd_staged_selected = m2.addVars(item_num, vtype=gp.GRB.BINARY, name='2nd_stage_selected')
+    sigma = m2.addVars(item_num, vtype=gp.GRB.BINARY, name='sigma')
 
-    # OBJ = purchase_fee * x.prod(realPrice)
-    OBJ = x.prod(realPrice)
+    OBJ = purchase_fee * x.prod(realPrice)
     for i in range(item_num):
-        OBJ = OBJ - penalty * realPrice[i] * snd_stage_removed[i] + 1/penalty * realPrice[i] * snd_staged_selected[i]
+        OBJ = OBJ - compensation_fee * realPrice[i] * sigma[i]
     m2.setObjective(OBJ, gp.GRB.MAXIMIZE)
 
-    m2.addConstr((x.prod(realWeight) - snd_stage_removed.prod(realWeight) + snd_staged_selected.prod(realWeight)) <= cap)
+    m2.addConstr((x.prod(realWeight) - sigma.prod(realWeight)) <= cap)
     for i in range(item_num):
         m2.addConstr(x[i] == predSol[i])
-        m2.addConstr(x[i] >= snd_stage_removed[i])
-        m2.addConstr(x[i] + snd_staged_selected[i] <= 1)
+        m2.addConstr(x[i] >= sigma[i])
 
     try:
         m2.optimize()
         objective = m2.objVal
         sol = []
-        x2_selecteditem_num = 0
+        x2_selectedItemNum = 0
         for i in range(item_num):
-            sol.append(x[i].x - snd_stage_removed[i].x + snd_staged_selected[i].x)
-            if x[i].x - snd_stage_removed[i].x + snd_staged_selected[i].x == 1:
-              x2_selecteditem_num = x2_selecteditem_num + 1
-#        print("Stage 2: ", sol, objective)
+            sol.append(x[i].x - sigma[i].x)
+            if x[i].x - sigma[i].x == 1:
+                x2_selectedItemNum = x2_selectedItemNum + 1
+    #        print("Stage 2: ", sol, objective)
     except:
         print(predPrice, predWeight, realPrice, realWeight, predSol)
 
-    return objective, sol
+    pass
+
+    res = (
+        OptimizationResults(obj=objective,
+                            first_stage_sol=[_x.x for _x in x.values()],
+                            second_stage_sol=[_x.x for _x in sigma.values()])
+    )
+
+    return res
+

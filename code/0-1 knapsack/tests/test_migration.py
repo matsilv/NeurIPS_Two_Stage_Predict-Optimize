@@ -14,7 +14,8 @@ from utils import correction_single_obj, StochasticWeightsKnapsackProblem
 
 class MyTestCase(unittest.TestCase):
 
-    _penalty = 1
+    _purchase_fee = 0.2
+    _compensation_fee = 0.21
     _dataset_filepath = os.path.join('data', 'synthetic')
     _features_filepath = os.path.join(_dataset_filepath, 'features_kp_50.csv')
     _values_filepath = os.path.join(_dataset_filepath, 'values_kp_50.csv')
@@ -46,7 +47,6 @@ class MyTestCase(unittest.TestCase):
         self._solutions = pd.read_csv(self._solutions_filepath, index_col=0).values
         self._capacity = np.load(self._capacity_filepath)
 
-    @unittest.skip
     def test_01_method_works(self):
         """
         Simply check if the method has some semantic errors.
@@ -58,21 +58,23 @@ class MyTestCase(unittest.TestCase):
         values_as_dict = {_idx: self._values[_idx] for _idx in range(item_num)}
         weights_as_dict = {_idx: self._weights[dataset_idx][_idx] for _idx in range(item_num)}
 
-        obj, sol = (
+        res = (
             correction_single_obj(values_as_dict,
                                   values_as_dict,
                                   self._capacity,
                                   weights_as_dict,
                                   weights_as_dict,
-                                  self._penalty,
+                                  purchase_fee=self._purchase_fee,
+                                  compensation_fee=self._compensation_fee,
                                   item_num=item_num)
         )
 
-        self.assertIsInstance(obj, float)
-        self.assertIsInstance(sol, list)
-        self.assertEqual(len(sol), item_num)
+        self.assertIsInstance(res.obj, float)
+        self.assertIsInstance(res.first_stage_sol, list)
+        self.assertEqual(len(res.first_stage_sol), item_num)
+        self.assertIsInstance(res.second_stage_sol, list)
+        self.assertEqual(len(res.second_stage_sol), item_num)
 
-    @unittest.skip
     def test_02_same_optimal_solutions(self):
         """
         Check if the true optimal solutions are compute the same way.
@@ -88,17 +90,18 @@ class MyTestCase(unittest.TestCase):
         for _weights, _expected_sol in tqdm(zip(weights_as_dict, self._solutions),
                                             desc='Checking optimal solutions',
                                             total=len(self._solutions)):
-            obj, computed_sol = (
+            opt_res = (
                 correction_single_obj(values_as_dict,
                                       values_as_dict,
                                       self._capacity,
                                       _weights,
                                       _weights,
-                                      self._penalty,
+                                      purchase_fee=self._purchase_fee,
+                                      compensation_fee=self._compensation_fee,
                                       item_num=item_num)
             )
 
-            self.assertTrue((_expected_sol == computed_sol).all())
+            self.assertTrue((_expected_sol == opt_res.first_stage_sol).all())
 
     def test_03_same_post_hoc_regret(self):
         """
@@ -111,7 +114,11 @@ class MyTestCase(unittest.TestCase):
         pred_weights = np.random.normal(loc=self._weights, scale=0.1)
 
         # How we define the problem in our repo.
-        opt_prob = StochasticWeightsKnapsackProblem(dim=item_num, penalty=self._penalty)
+        opt_prob = (
+            StochasticWeightsKnapsackProblem(dim=item_num,
+                                             purchase_fee=self._purchase_fee,
+                                             compensation_fee=self._compensation_fee)
+        )
         opt_prob_params = {
             'values': torch.as_tensor(self._values),
             'capacity': torch.as_tensor(self._capacity)
@@ -130,13 +137,14 @@ class MyTestCase(unittest.TestCase):
         for _true_wgt, _pred_wgt in tqdm(zip(true_weights_as_dict, pred_weights_as_dict),
                                             desc='Post-hoc regret',
                                             total=len(self._solutions)):
-            obj, computed_sol = (
+            computed_res = (
                 correction_single_obj(values_as_dict,
                                       values_as_dict,
                                       self._capacity,
                                       _true_wgt,
                                       _pred_wgt,
-                                      self._penalty,
+                                      purchase_fee=self._purchase_fee,
+                                      compensation_fee=self._compensation_fee,
                                       item_num=item_num)
             )
 
@@ -151,14 +159,16 @@ class MyTestCase(unittest.TestCase):
             )
             expected_fst_stage_sol = torch.as_tensor(expected_fst_stage_sol)
 
-            expected_obj, _ = (
+            expected_res = (
                 opt_prob.get_objective_values(y=true_weights_as_tensor,
                                               sols=expected_fst_stage_sol,
                                               opt_prob_params=opt_prob_params)
             )
 
             # There might be some approximation errors.
-            self.assertAlmostEqual(expected_obj, obj, places=7)
+            self.assertAlmostEqual(expected_res.obj, computed_res.obj, places=7)
+            self.assertEqual(expected_res.first_stage_sol, computed_res.first_stage_sol)
+            self.assertEqual(expected_res.second_stage_sol, computed_res.second_stage_sol)
 
 
 if __name__ == '__main__':
